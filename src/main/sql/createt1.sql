@@ -12,4 +12,5 @@ create table if not exists basic_record (
 ,net_pkt_recv_err DOUBLE
 )
 PARTITIONED BY (cdate BIGINT)
-STORED AS PARQUET;
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+STORED AS TEXTFILE;

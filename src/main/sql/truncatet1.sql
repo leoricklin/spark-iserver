@@ -1,1 +1,1 @@
-truncate table basic_record partition (cdate=20150914);
+truncate table basic_record partition (cdate=20150915);
