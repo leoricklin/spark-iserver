@@ -382,30 +382,46 @@ root
 
 
   def load2Hive(basicoutpath:String, parttionid:Long) = {
-    val url="jdbc:hive2://10.176.32.79:10000/default?mapred.job.queue.name=root.PERSONAL.leoricklin"
-    val username = "leoricklin"
-    val password = "leoricklin"
-    val driverName="org.apache.hive.jdbc.HiveDriver"
-    val conn: Connection = DriverManager.getConnection(url, username, password);
+    // var basicoutpath = "hdfs:///hive/tlbd_upload/iserver/txt/basic.20150915"
+    // var parttionid = 20150915L
+    var url="jdbc:hive2://10.176.32.79:10000/tlbd?mapred.job.queue.name=root.PERSONAL.leoricklin"
+    var username = "leoricklin"
+    var password = "leoricklin"
+    var driverName="org.apache.hive.jdbc.HiveDriver"
+    Class.forName(driverName).newInstance
+    val conn: Connection = DriverManager.getConnection(url, username, password)
     val stmt: Statement = conn.createStatement()
-    var query = s"load data inpath '${basicoutpath}' into table basic_record partition (cdate=${parttionid}})"
-    val basicRecords: ResultSet = stmt.executeQuery(query)
-    if (basicRecords.next()) {
-      println(f"time=${basicRecords.getLong(1)}, id=${basicRecords.getLong(2)}")
-    }
+    var query = f"load data inpath '${basicoutpath}' into table basic_record partition (cdate=${parttionid})"
+    var result = stmt.execute(query)
     conn.close()
   }
   /*
-  val basicRecords: JdbcRDD[BasicRecord] = new JdbcRDD( sc
+    val basicRecords: JdbcRDD[BasicRecord] = new JdbcRDD( sc
     , () => DriverManager.getConnection(url,username,password)
     , query
     , 1441843200000L, 1441929599000L, 64
     , r => BasicRecord(r.getLong(1),r.getLong(2), r.getDouble(3)
       , r.getDouble(4), r.getDouble(5), r.getDouble(6)
       , r.getDouble(7), r.getDouble(8), r.getDouble(9), r.getDouble(10))
-  )
+    )
 
-  res4: Any = time=1441814401969, id=22640
+    res4: Any = time=1441814401969, id=22640
+
+    query = f"select * from basic_record where cdate=${parttionid} limit 10"
+    var resultset = stmt.executeQuery(query)
+    while (resultset.next()) {
+      println(f"time=${resultset.getLong(1)}, id=${resultset.getLong(2)}")
+    }
+time=1441814401969, id=22640
+time=1441814401969, id=22824
+time=1441814401969, id=25172
+time=1441814401969, id=31844
+time=1441814401969, id=32244
+time=1441814401969, id=32688
+time=1441814401969, id=33264
+time=1441814403000, id=11416
+time=1441814403000, id=24104
+time=1441814403000, id=32084
    */
 
   def main(args: Array[String]) {
