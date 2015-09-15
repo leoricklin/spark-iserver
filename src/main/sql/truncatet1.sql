@@ -1,0 +1,1 @@
+truncate table basic_record partition (cdate=20150914);
