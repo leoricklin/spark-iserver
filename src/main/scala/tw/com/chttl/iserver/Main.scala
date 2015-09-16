@@ -279,14 +279,16 @@ root
    */
 
   def saveBasicRecords(parsedLogs: RDD[BasicRecord], path:String) = {
-    parsedLogs.map{ case BasicRecord(now:Long, id:Long, cpu_usage:Double
+    val saved = parsedLogs.map{ case BasicRecord(now:Long, id:Long, cpu_usage:Double
     , mem_phy_usage:Double, mem_cache_usage:Double, mem_load:Double
     , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double) =>
       Array(now.toString, id.toString, cpu_usage.toString
       , mem_phy_usage.toString, mem_cache_usage.toString, mem_load.toString
       , net_out.toString, net_in.toString, net_pkt_send_err.toString, net_pkt_recv_err.toString
       ).mkString(_SEPARATOR)
-    }.coalesce(64).saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
+    }
+    saved.coalesce(64).saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
+    saved.count()
   }
   /*
 1 core/2 GB * 64 workers with 277 files of total 2.3GB = 40 secs
@@ -300,9 +302,11 @@ ive/tlbd_upload/iserver/parquet/basic.20150914/_SUCCESS
    */
 
   def saveComplexRecords(parsedLogs: RDD[ComplexRecord], path:String) = {
-    parsedLogs.map{ case ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double) =>
+    val saved = parsedLogs.map{ case ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double) =>
       Array(now.toString, id.toString, cate.toString, item, usage.toString).mkString(_SEPARATOR)
-    }.coalesce(64).saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
+    }
+    saved.coalesce(64).saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
+    saved.count()
   }
   /*
 1 core/2 GB * 64 workers with 277 files of total 2.3GB = 30 secs
@@ -326,8 +330,9 @@ Found 66 items
     basicRecords
   }
   /*
-  val basicRecords = readBasicRecords(sc, basicoutpath)
+  val basicRecords = readBasicRecords(sc, f"${basicoutpath}.${tx.toString}")
   basicRecords.printSchema()
+  basicRecords.count = 2586182
 root
 |-- now: long (nullable = false)
 |-- id: long (nullable = false)
@@ -358,7 +363,7 @@ root
     complexRecords
   }
   /*
-  val complexRecords = readComplexRecords(sc, complexoutpath)
+  val complexRecords = readComplexRecords(sc, f"${complexoutpath}.${tx.toString}")
   complexRecords.printSchema
 root
 |-- now: long (nullable = false)
@@ -366,7 +371,7 @@ root
 |-- cate: byte (nullable = false)
 |-- item: string (nullable = true)
 |-- usage: double (nullable = false)
-
+  complexRecords.count = 26964238
   complexRecords.registerTempTable("complex_record")
   val t43 = sqlContext.sql("select now, id, cate" +
     " , item, usage" +
@@ -380,10 +385,7 @@ root
   , [1441872159969,31208,3,/var,2.946591])
    */
 
-
-  def load2Hive(basicoutpath:String, parttionid:Long) = {
-    // var basicoutpath = "hdfs:///hive/tlbd_upload/iserver/txt/basic.20150915"
-    // var parttionid = 20150915L
+  def load2Hive(basicoutpath:String, complexoutpath:String, partionid:Long) = {
     var url="jdbc:hive2://10.176.32.79:10000/tlbd?mapred.job.queue.name=root.PERSONAL.leoricklin"
     var username = "leoricklin"
     var password = "leoricklin"
@@ -391,9 +393,19 @@ root
     Class.forName(driverName).newInstance
     val conn: Connection = DriverManager.getConnection(url, username, password)
     val stmt: Statement = conn.createStatement()
-    var query = f"load data inpath '${basicoutpath}' into table basic_record partition (cdate=${parttionid})"
-    var result = stmt.execute(query)
+    var query = f"load data inpath '${basicoutpath}' into table basic_record partition (cdate=${partionid})"
+    var result = stmt.execute(query) // true if the first result is a ResultSet object; false if it is an update count or there are no results
+    query = f"select count(1) from basic_record where cdate=${partionid}"
+    var resultset = stmt.executeQuery(query)
+    val basicRecCnt = if (resultset.next()) resultset.getLong(1) else 0L // 2586182
+    //
+    query = f"load data inpath '${complexoutpath}' into table complex_record partition (cdate=${partionid})"
+    result = stmt.execute(query)
+    query = f"select count(1) from complex_record where cdate=${partionid}"
+    resultset = stmt.executeQuery(query)
+    val complexRecCnt = if (resultset.next()) resultset.getLong(1) else 0L // 26964238
     conn.close()
+    Array(basicRecCnt, complexRecCnt)
   }
   /*
     val basicRecords: JdbcRDD[BasicRecord] = new JdbcRDD( sc
@@ -429,8 +441,8 @@ time=1441814403000, id=32084
 val args = Array("/home/leoricklin/dataset/iserver")
 
 val args = Array("hdfs:///hive/tlbd_upload/iserver/log"
-,"hdfs:///hive/tlbd_upload/iserver/txt/basic.20150915"
-,"hdfs:///hive/tlbd_upload/iserver/txt/complex.20150915")
+,"hdfs:///hive/tlbd_upload/iserver/txt/basic"
+,"hdfs:///hive/tlbd_upload/iserver/txt/complex")
 
 $ hdfs dfs -du -s /hive/tlbd_upload/iserver/log
 2,310,400,905  6931202715  /hive/tlbd_upload/iserver/log
@@ -442,13 +454,17 @@ $ hdfs dfs -ls /hive/tlbd_upload/iserver/log|wc -l
         println("Usage: <app_name> <input_path> <basic_output_path> <complex_output_path>")
         System.exit(1)
       }
+      val tx = System.currentTimeMillis()
       val Array(inpath, basicoutpath, complexoutpath) = args
       val raw: RDD[String] = loadSrc(sc, inpath)
       val tokens: RDD[Array[String]] = tokenize(raw)
       val logs: SchemaRDD = getDF(sqlContext, tokens)
       val records: RDD[(BasicRecord, ArrayBuffer[ComplexRecord])] = parseLog(sqlContext, logs)
-      saveBasicRecords(records.map{ case (basic, ary) => basic}, basicoutpath)
-      saveComplexRecords(records.flatMap{ case (basic, ary) => ary}, complexoutpath)
+      val basicCnt: Long = saveBasicRecords(records.map{ case (basic, ary) => basic}, f"${basicoutpath}.${tx.toString}")
+      val complexCnt: Long = saveComplexRecords(records.flatMap{ case (basic, ary) => ary}, f"${complexoutpath}.${tx.toString}")
+      // 2586182, 26964238
+      val cnts: Array[Long] = load2Hive(f"${basicoutpath}.${tx.toString}", f"${complexoutpath}.${tx.toString}", 20150916L)
+      // Array(2586182, 26964238)
     } catch {
       case e: org.apache.hadoop.mapred.InvalidInputException => System.err.println(e.getMessage)
     }
