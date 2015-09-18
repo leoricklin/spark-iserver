@@ -46,8 +46,6 @@ object Main {
   }
   /*
   val stats = NAStat.statsWithMissing(tokens.map{ ary => Array(ary.size)})
-
-1 core/2 GB * 64 workers with 277 files of total 2.3GB = 1.2 mins
   logs.printSchema()
 root
 |-- AgentData: struct (nullable = true)
@@ -151,7 +149,7 @@ root
         rows ++= pars.map{ case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_pr, item, usage.toDouble) }
         // process partition key
         cald.setTimeInMillis(r_now)
-        val partKey = f"${cald.get(Calendar.YEAR)}%04d${cald.get(Calendar.MONTH)}%02d${cald.get(Calendar.DAY_OF_MONTH)}%02d".toLong
+        val partKey = f"${cald.get(Calendar.YEAR)}%04d${cald.get(Calendar.MONTH)+1}%02d${cald.get(Calendar.DAY_OF_MONTH)}%02d".toLong
         // emit
         (
           partKey
@@ -302,7 +300,6 @@ root
     saved.count()
   }
   /*
-1 core/2 GB * 64 workers with 277 files of total 2.3GB = 40 secs
 hdfs dfs -ls  hdfs://nameservice1/hive/tlbd_upload/iserver/parquet/basic.20150914
 Found 66 items
 -rw-rw----+  3 leoricklin hive          0 2015-09-14 15:51 hdfs://nameservice1/h
@@ -320,7 +317,6 @@ ive/tlbd_upload/iserver/parquet/basic.20150914/_SUCCESS
     saved.count()
   }
   /*
-1 core/2 GB * 64 workers with 277 files of total 2.3GB = 30 secs
 hdfs dfs -ls  hdfs://nameservice1/hive/tlbd_upload/iserver/parquet/complex.20150914
 Found 66 items
 -rw-rw----+  3 leoricklin hive          0 2015-09-14 16:28 hdfs://nameservice1/hive/tlbd_upload/iserver/parquet/complex.20150914/_SUCCESS
@@ -396,7 +392,7 @@ root
   , [1441872159969,31208,3,/var,2.946591])
    */
 
-  def load2Hive(basicoutpath:String, complexoutpath:String, partionid:Long) = {
+  def loadRecords2Hive(basicPaths:Array[(Long, String)], complexPaths:Array[(Long, String)]) = {
     var url="jdbc:hive2://10.176.32.79:10000/tlbd?mapred.job.queue.name=root.PERSONAL.leoricklin"
     var username = "leoricklin"
     var password = "leoricklin"
@@ -404,19 +400,23 @@ root
     Class.forName(driverName).newInstance
     val conn: Connection = DriverManager.getConnection(url, username, password)
     val stmt: Statement = conn.createStatement()
-    var query = f"load data inpath '${basicoutpath}' into table basic_record partition (cdate=${partionid})"
-    var result = stmt.execute(query) // true if the first result is a ResultSet object; false if it is an update count or there are no results
-    query = f"select count(1) from basic_record where cdate=${partionid}"
-    var resultset = stmt.executeQuery(query)
-    val basicRecCnt = if (resultset.next()) resultset.getLong(1) else 0L // 2586182
+    var query = ""
     //
-    query = f"load data inpath '${complexoutpath}' into table complex_record partition (cdate=${partionid})"
-    result = stmt.execute(query)
-    query = f"select count(1) from complex_record where cdate=${partionid}"
-    resultset = stmt.executeQuery(query)
-    val complexRecCnt = if (resultset.next()) resultset.getLong(1) else 0L // 26964238
+    val loadCnts: Array[Array[Boolean]] = for ( tbl <- Array((basicPaths, "basic_record"), (complexPaths, "complex_record")) ) yield {
+      val loadRows: Array[Boolean] = tbl._1.map{ case (partitionid, path) =>
+        query = f"load data inpath '${path}' into table ${tbl._2} partition (cdate=${partitionid})"
+        stmt.execute(query) // true if the first result is a ResultSet object; false if it is an update count or there are no results
+        /*
+        query = f"select count(1) from basic_record where cdate=${partitionid}"
+        val resultset: ResultSet = stmt.executeQuery(query)
+        if (resultset.next()) resultset.getLong(1) else 0L // 2586182
+         */
+      }
+      loadRows
+    }
+    //
     conn.close()
-    Array(basicRecCnt, complexRecCnt)
+    loadCnts
   }
   /*
     val basicRecords: JdbcRDD[BasicRecord] = new JdbcRDD( sc
@@ -471,22 +471,38 @@ $ hdfs dfs -ls /hive/tlbd_upload/iserver/log|wc -l
       val logDF: SchemaRDD = src2DF(sqlContext, raw)
       val records: RDD[(Long, BasicRecord, ArrayBuffer[ComplexRecord])] = parseDF(sqlContext, logDF)
       records.persist(StorageLevel.MEMORY_AND_DISK)
-      val partKeys = records.map{case (key, basic, ary) => key}.distinct().collect()
+      val partKeys: Array[Long] = records.map{case (key, basic, ary) => key}.distinct().collect()
       val recordsByKey: Array[(Long, RDD[(Long, BasicRecord, ArrayBuffer[ComplexRecord])])] = partKeys.map{ idx =>
         (idx, records.filter{ case (key, basic, ary) => key.equals(idx)} )
       }
       //
-      /* FILTER BY
-      val ret = recordsByKey.map{ case (idx, rdd) => (idx, rdd.count())}
-      : Array[(Long, Long)] = Array((20150810,615328), (20150811,635940), (20150812,660306), (20150813,674579), (20150814,29))
-1 core/2 GB * 64 workers with 277 files of total 2.3GB = 55.59 sec ( with RDD.persist )
-       */
-      /* GROUP BY
-      val recordsByKey: RDD[(Long, Iterable[(Long, BasicRecord, ArrayBuffer[ComplexRecord])])] = records.groupBy{
-        case (key, basicRecord, complexRecords) => key }
-      val ret = recordsByKey.map{ case (key, ite) => (key, ite.size)}.collect()
-      : Array[(Long, Int)] = Array((20150810,615328), (20150811,635940), (20150812,660306), (20150813,674579), (20150814,29))
-1 core/2 GB * 64 workers with 277 files of total 2.3GB = 160 sec ( with RDD.persist )
+      val basicCnts: Array[(Long, Long)] = recordsByKey.map{ case (idx, rdd) =>
+        ( idx
+          ,saveBasicRecords(rdd.map{ case (key, basic, ary) => basic}, f"${basicoutpath}.${idx.toString}")
+        )
+      }
+      val complexCnts: Array[(Long, Long)] = recordsByKey.map { case (idx, rdd) =>
+        ( idx
+          ,saveComplexRecords(rdd.flatMap{ case (key, basic, ary) => ary}, f"${complexoutpath}.${idx.toString}")
+        )
+      }
+      val basicPaths: Array[(Long, String)] = recordsByKey.map { case (idx, rdd) => (idx, f"${basicoutpath}.${idx.toString}") }
+      val complexPaths: Array[(Long, String)] = recordsByKey.map { case (idx, rdd) => (idx, f"${complexoutpath}.${idx.toString}") }
+      val cnts = loadRecords2Hive(basicPaths, complexPaths)
+      // Array(2586182, 26964238)
+    } catch {
+      case e: org.apache.hadoop.mapred.InvalidInputException => System.err.println(e.getMessage)
+    }
+  }
+  /* FILTER BY
+  val ret = recordsByKey.map{ case (idx, rdd) => (idx, rdd.count())}
+  : Array[(Long, Long)] = Array((20150810,615328), (20150811,635940), (20150812,660306), (20150813,674579), (20150814,29))
+   */
+  /* GROUP BY
+  val recordsByKey: RDD[(Long, Iterable[(Long, BasicRecord, ArrayBuffer[ComplexRecord])])] = records.groupBy{
+    case (key, basicRecord, complexRecords) => key }
+  val ret = recordsByKey.map{ case (key, ite) => (key, ite.size)}.collect()
+  : Array[(Long, Int)] = Array((20150810,615328), (20150811,635940), (20150812,660306), (20150813,674579), (20150814,29))
 由於#keys=5, groupBy 的 shuffle 階段僅有 5 tasks 接收資料
 +----+--------+------------+
 |task|duration|shuffle read|
@@ -496,19 +512,15 @@ $ hdfs dfs -ls /hive/tlbd_upload/iserver/log|wc -l
 |169 |56  s   | 96.9 M     |
 |172 |0.2 s   | 7.2  K     |
 +----+--------+------------+
-       */
-      val basicCnts: Array[Long] = recordsByKey.map{ case (idx, rdd) =>
-        saveBasicRecords(rdd.map{ case (key, basic, ary) => basic}, f"${basicoutpath}.${idx.toString}")
-      }
-      // Array[Long] = Array(615328, 635940, 660306, 674579, 29)
-      val complexCnts = recordsByKey.map { case (idx, rdd) =>
-        saveComplexRecords(rdd.flatMap{ case (key, basic, ary) => ary}, f"${complexoutpath}.${idx.toString}")
-      }
-      // complexCnts: Array[Long] = Array(7145941, 6280175, 6529955, 7007741, 426)
-      val cnts: Array[Long] = load2Hive(f"${basicoutpath}.${tx.toString}", f"${complexoutpath}.${tx.toString}", 20150916L)
-      // Array(2586182, 26964238)
-    } catch {
-      case e: org.apache.hadoop.mapred.InvalidInputException => System.err.println(e.getMessage)
-    }
-  }
+   */
+  /*
+resources : 1 core / 4g * 64 workers
+input     : 484 files with total size of 4,039,541,352
+output    :
+partKeys    : Array[Long] = Array(20150910, 20150911, 20150912, 20150913, 20150914, 20150915, 20150916, 20150917)
+basicCnts   : Array[Long] = Array(615328  , 635940  , 660306  , 674579  , 665556  , 657641  , 652725  , 18)
+complexCnts : Array[Long] = Array(7145941 , 6280175 , 6529955 , 7007741 , 6655225 , 6441167 , 6327969 , 138)
+duration  : 2015/09/18 14:17:53 ~ 2015/09/18 14:20:44 = 2 min 51 sec
+   */
+
 }
