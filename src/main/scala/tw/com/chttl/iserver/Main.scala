@@ -3,11 +3,13 @@ package tw.com.chttl.iserver
 import org.apache.spark.rdd.RDD
 import org.apache.spark.{SparkContext, SparkConf}
 import org.apache.spark.sql.{SchemaRDD, Row}
+import org.apache.spark.storage.StorageLevel
 import scala.collection.mutable.ArrayBuffer
 import tw.com.chttl.spark.core.util._
 import tw.com.chttl.spark.mllib.util._
 import org.apache.spark.rdd.JdbcRDD
 import java.sql.{Statement, Connection, DriverManager, ResultSet}
+import java.util.Calendar
 
 /**
  * Created by leorick on 2015/9/9.
@@ -16,7 +18,10 @@ object Main {
   val appName = "iServer Log ETL"
   val sparkConf = new SparkConf().setAppName(appName)
   val sc = new SparkContext(sparkConf)
-
+  sc.getConf.set("spark.driver.maxResultSize", "2g")
+  sc.getConf.getOption("spark.driver.maxResultSize").getOrElse("")
+  //
+  import org.apache.spark.SparkContext._
   val sqlContext = new org.apache.spark.sql.SQLContext(sc)
   import sqlContext._
   val _SEPARATOR = "\t"
@@ -35,17 +40,13 @@ object Main {
     sc.textFile(path)
   }
 
-  def tokenize(raw:RDD[String]) = {
-    raw.map{ line => StringHelper.tokenize(line,"\t\t",true) }
-  }
-  /*
-  val stats = NAStat.statsWithMissing(tokens.map{ ary => Array(ary.size)})
-   */
-
-  def getDF(sqlContext:org.apache.spark.sql.SQLContext, tokens:RDD[Array[String]]) = {
+  def src2DF(sqlContext:org.apache.spark.sql.SQLContext, raw:RDD[String]) = {
+    val tokens = raw.map{ line => StringHelper.tokenize(line,"\t\t",true) }
     sqlContext.jsonRDD( tokens.map{ tokens => tokens(1) } )
   }
   /*
+  val stats = NAStat.statsWithMissing(tokens.map{ ary => Array(ary.size)})
+
 1 core/2 GB * 64 workers with 277 files of total 2.3GB = 1.2 mins
   logs.printSchema()
 root
@@ -105,7 +106,7 @@ root
 
    */
 
-  def parseLog(sqlContext:org.apache.spark.sql.SQLContext, logs:SchemaRDD) = {
+  def parseDF(sqlContext:org.apache.spark.sql.SQLContext, logs:SchemaRDD) = {
     logs.registerTempTable("logs")
     val sqlRdd = sqlContext.sql("select AgentData.NowTime, id" +
       " ,AgentData.CPUItem.Usage as cpu_usage" +
@@ -115,39 +116,49 @@ root
       " ,AgentData.LV as lvs" +
       " ,AgentData.PartitionItem as pars" +
       " from logs")
-    val records = sqlRdd.map{ case Row(nowtime:String, id:String
-    , cpu_usage:String, memitems:ArrayBuffer[Row], netitems:ArrayBuffer[Row]
-    , hds:ArrayBuffer[Row], lvs:ArrayBuffer[Row], pars:ArrayBuffer[Row]) =>
-      val r_now = nowtime.toLong
-      val r_id = id.toLong
-      val mems: (Double, Double, Double) = memitems.map{
-        case Row("phy_usage",   usage:String) => (usage.toDouble, 0D, 0D)
-        case Row("cache_usage", usage:String) => (0D, usage.toDouble, 0D)
-        case Row("memory_load", usage:String) => (0D, 0D, usage.toDouble)
-        case _ => (0D, 0D, 0D)
-      }.reduce{ (tup1, tup2) =>
-        (tup1._1+tup2._1 , tup1._2+tup2._2 , tup1._3+tup2._3)
+    val records = sqlRdd.mapPartitions{ ite =>
+      val cald: Calendar = new java.util.GregorianCalendar()
+      ite.map{ case Row(nowtime:String, id:String
+      , cpu_usage:String, memitems:ArrayBuffer[Row], netitems:ArrayBuffer[Row]
+      , hds:ArrayBuffer[Row], lvs:ArrayBuffer[Row], pars:ArrayBuffer[Row]) =>
+        // process basic record
+        val r_now = nowtime.toLong
+        val r_id = id.toLong
+        val mems: (Double, Double, Double) = memitems.map{
+          case Row("phy_usage",   usage:String) => (usage.toDouble, 0D, 0D)
+          case Row("cache_usage", usage:String) => (0D, usage.toDouble, 0D)
+          case Row("memory_load", usage:String) => (0D, 0D, usage.toDouble)
+          case _ => (0D, 0D, 0D)
+        }.reduce{ (tup1, tup2) =>
+          (tup1._1+tup2._1 , tup1._2+tup2._2 , tup1._3+tup2._3)
+        }
+        val nets = netitems.map{
+          case Row("outbound",          usage:String) => (usage.toDouble, 0D, 0D, 0D)
+          case Row("inbound",           usage:String) => (0D, usage.toDouble, 0D, 0D)
+          case Row("packet_send_error", usage:String) => (0D, 0D, usage.toDouble, 0D)
+          case Row("packet_recv_error", usage:String) => (0D, 0D, 0D, usage.toDouble)
+          case _ => (0D, 0D, 0D, 0D)
+        }.reduce{ (tup1, tup2) =>
+          (tup1._1+tup2._1 , tup1._2+tup2._2 , tup1._3+tup2._3 , tup1._4+tup2._4)
+        }
+        // process complex record
+        val rows = new ArrayBuffer[ComplexRecord]()
+        val r_hd:Byte = 1
+        val r_lv:Byte = 2
+        val r_pr:Byte = 3
+        rows ++= hds.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_hd, item, usage.toDouble) }
+        rows ++= lvs.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_lv, item, usage.toDouble) }
+        rows ++= pars.map{ case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_pr, item, usage.toDouble) }
+        // process partition key
+        cald.setTimeInMillis(r_now)
+        val partKey = f"${cald.get(Calendar.YEAR)}%04d${cald.get(Calendar.MONTH)}%02d${cald.get(Calendar.DAY_OF_MONTH)}%02d".toLong
+        // emit
+        (
+          partKey
+          ,new BasicRecord(r_now, r_id, cpu_usage.toDouble, mems._1, mems._2, mems._3, nets._1, nets._2, nets._3, nets._4)
+          ,rows
+        )
       }
-      val nets = netitems.map{
-        case Row("outbound",          usage:String) => (usage.toDouble, 0D, 0D, 0D)
-        case Row("inbound",           usage:String) => (0D, usage.toDouble, 0D, 0D)
-        case Row("packet_send_error", usage:String) => (0D, 0D, usage.toDouble, 0D)
-        case Row("packet_recv_error", usage:String) => (0D, 0D, 0D, usage.toDouble)
-        case _ => (0D, 0D, 0D, 0D)
-      }.reduce{ (tup1, tup2) =>
-        (tup1._1+tup2._1 , tup1._2+tup2._2 , tup1._3+tup2._3 , tup1._4+tup2._4)
-      }
-      //
-      val rows = new ArrayBuffer[ComplexRecord]()
-      val r_hd:Byte = 1
-      val r_lv:Byte = 2
-      val r_pr:Byte = 3
-      rows ++= hds.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_hd, item, usage.toDouble) }
-      rows ++= lvs.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_lv, item, usage.toDouble) }
-      rows ++= pars.map{ case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_pr, item, usage.toDouble) }
-      ( new BasicRecord(r_now, r_id, cpu_usage.toDouble, mems._1, mems._2, mems._3, nets._1, nets._2, nets._3, nets._4)
-        ,rows
-      )
     }
     records
   }
@@ -457,12 +468,43 @@ $ hdfs dfs -ls /hive/tlbd_upload/iserver/log|wc -l
       val tx = System.currentTimeMillis()
       val Array(inpath, basicoutpath, complexoutpath) = args
       val raw: RDD[String] = loadSrc(sc, inpath)
-      val tokens: RDD[Array[String]] = tokenize(raw)
-      val logs: SchemaRDD = getDF(sqlContext, tokens)
-      val records: RDD[(BasicRecord, ArrayBuffer[ComplexRecord])] = parseLog(sqlContext, logs)
-      val basicCnt: Long = saveBasicRecords(records.map{ case (basic, ary) => basic}, f"${basicoutpath}.${tx.toString}")
-      val complexCnt: Long = saveComplexRecords(records.flatMap{ case (basic, ary) => ary}, f"${complexoutpath}.${tx.toString}")
-      // 2586182, 26964238
+      val logDF: SchemaRDD = src2DF(sqlContext, raw)
+      val records: RDD[(Long, BasicRecord, ArrayBuffer[ComplexRecord])] = parseDF(sqlContext, logDF)
+      records.persist(StorageLevel.MEMORY_AND_DISK)
+      val partKeys = records.map{case (key, basic, ary) => key}.distinct().collect()
+      val recordsByKey: Array[(Long, RDD[(Long, BasicRecord, ArrayBuffer[ComplexRecord])])] = partKeys.map{ idx =>
+        (idx, records.filter{ case (key, basic, ary) => key.equals(idx)} )
+      }
+      //
+      /* FILTER BY
+      val ret = recordsByKey.map{ case (idx, rdd) => (idx, rdd.count())}
+      : Array[(Long, Long)] = Array((20150810,615328), (20150811,635940), (20150812,660306), (20150813,674579), (20150814,29))
+1 core/2 GB * 64 workers with 277 files of total 2.3GB = 55.59 sec ( with RDD.persist )
+       */
+      /* GROUP BY
+      val recordsByKey: RDD[(Long, Iterable[(Long, BasicRecord, ArrayBuffer[ComplexRecord])])] = records.groupBy{
+        case (key, basicRecord, complexRecords) => key }
+      val ret = recordsByKey.map{ case (key, ite) => (key, ite.size)}.collect()
+      : Array[(Long, Int)] = Array((20150810,615328), (20150811,635940), (20150812,660306), (20150813,674579), (20150814,29))
+1 core/2 GB * 64 workers with 277 files of total 2.3GB = 160 sec ( with RDD.persist )
+由於#keys=5, groupBy 的 shuffle 階段僅有 5 tasks 接收資料
++----+--------+------------+
+|task|duration|shuffle read|
+|171 |1.3 min |108.2 M     |
+|170 |30  s   |102.4 M     |
+|168 |1.3 min | 97.3 M     |
+|169 |56  s   | 96.9 M     |
+|172 |0.2 s   | 7.2  K     |
++----+--------+------------+
+       */
+      val basicCnts: Array[Long] = recordsByKey.map{ case (idx, rdd) =>
+        saveBasicRecords(rdd.map{ case (key, basic, ary) => basic}, f"${basicoutpath}.${idx.toString}")
+      }
+      // Array[Long] = Array(615328, 635940, 660306, 674579, 29)
+      val complexCnts = recordsByKey.map { case (idx, rdd) =>
+        saveComplexRecords(rdd.flatMap{ case (key, basic, ary) => ary}, f"${complexoutpath}.${idx.toString}")
+      }
+      // complexCnts: Array[Long] = Array(7145941, 6280175, 6529955, 7007741, 426)
       val cnts: Array[Long] = load2Hive(f"${basicoutpath}.${tx.toString}", f"${complexoutpath}.${tx.toString}", 20150916L)
       // Array(2586182, 26964238)
     } catch {
