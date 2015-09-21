@@ -32,15 +32,12 @@ object Main {
 
   case class BasicRecord(now:Long, id:Long, cpu_usage:Double
   , mem_phy_usage:Double, mem_cache_usage:Double, mem_load:Double
-  , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double)
+  , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double, cdate:Long, ftime:Byte)
 
-  case class ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double)
+  case class ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double, cdate:Long, ftime:Byte)
 
-  def loadSrc(sc:SparkContext, path:String): RDD[String] = {
-    sc.textFile(path)
-  }
-
-  def src2DF(sqlContext:org.apache.spark.sql.SQLContext, raw:RDD[String]) = {
+  def loadSrc(sc:SparkContext, sqlContext:org.apache.spark.sql.SQLContext, path:String) = {
+    val raw = sc.textFile(path)
     val tokens = raw.map{ line => StringHelper.tokenize(line,"\t\t",true) }
     sqlContext.jsonRDD( tokens.map{ tokens => tokens(1) } )
   }
@@ -122,6 +119,10 @@ root
         // process basic record
         val r_now = nowtime.toLong
         val r_id = id.toLong
+        // process partition columns
+        cald.setTimeInMillis(r_now)
+        val cdate = f"${cald.get(Calendar.YEAR)}%04d${cald.get(Calendar.MONTH)+1}%02d${cald.get(Calendar.DAY_OF_MONTH)}%02d".toLong
+        val ftime = f"${cald.get(Calendar.HOUR_OF_DAY)}%02d".toByte
         val mems: (Double, Double, Double) = memitems.map{
           case Row("phy_usage",   usage:String) => (usage.toDouble, 0D, 0D)
           case Row("cache_usage", usage:String) => (0D, usage.toDouble, 0D)
@@ -144,17 +145,14 @@ root
         val r_hd:Byte = 1
         val r_lv:Byte = 2
         val r_pr:Byte = 3
-        rows ++= hds.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_hd, item, usage.toDouble) }
-        rows ++= lvs.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_lv, item, usage.toDouble) }
-        rows ++= pars.map{ case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_pr, item, usage.toDouble) }
+        rows ++= hds.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_hd, item, usage.toDouble, cdate, ftime) }
+        rows ++= lvs.map{  case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_lv, item, usage.toDouble, cdate, ftime) }
+        rows ++= pars.map{ case Row(item:String, usage:String) => new ComplexRecord(r_now, r_id, r_pr, item, usage.toDouble, cdate, ftime) }
         // process partition key
-        cald.setTimeInMillis(r_now)
-        val partKey = f"${cald.get(Calendar.YEAR)}%04d${cald.get(Calendar.MONTH)+1}%02d${cald.get(Calendar.DAY_OF_MONTH)}%02d".toLong
         // emit
         (
-          partKey
-          ,new BasicRecord(r_now, r_id, cpu_usage.toDouble, mems._1, mems._2, mems._3, nets._1, nets._2, nets._3, nets._4)
-          ,rows
+         new BasicRecord(r_now, r_id, cpu_usage.toDouble, mems._1, mems._2, mems._3, nets._1, nets._2, nets._3, nets._4, cdate, ftime)
+         ,rows
         )
       }
     }
@@ -290,10 +288,11 @@ root
   def saveBasicRecords(parsedLogs: RDD[BasicRecord], path:String) = {
     val saved = parsedLogs.map{ case BasicRecord(now:Long, id:Long, cpu_usage:Double
     , mem_phy_usage:Double, mem_cache_usage:Double, mem_load:Double
-    , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double) =>
+    , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double, cdate:Long, ftime:Byte) =>
       Array(now.toString, id.toString, cpu_usage.toString
       , mem_phy_usage.toString, mem_cache_usage.toString, mem_load.toString
       , net_out.toString, net_in.toString, net_pkt_send_err.toString, net_pkt_recv_err.toString
+      , cdate.toString, ftime.toString
       ).mkString(_SEPARATOR)
     }
     saved.coalesce(64).saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
@@ -310,8 +309,9 @@ ive/tlbd_upload/iserver/parquet/basic.20150914/_SUCCESS
    */
 
   def saveComplexRecords(parsedLogs: RDD[ComplexRecord], path:String) = {
-    val saved = parsedLogs.map{ case ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double) =>
-      Array(now.toString, id.toString, cate.toString, item, usage.toString).mkString(_SEPARATOR)
+    val saved = parsedLogs.map{ case ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double, cdate:Long, ftime:Byte) =>
+      Array(now.toString, id.toString, cate.toString, item, usage.toString, cdate.toString, ftime.toString
+      ).mkString(_SEPARATOR)
     }
     saved.coalesce(64).saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
     saved.count()
@@ -329,10 +329,12 @@ Found 66 items
     val basicRecords = sc.textFile(path).map{line => line.split(_SEPARATOR)}.map{
       case Array(now, id, cpu_usage
       , mem_phy_usage, mem_cache_usage, mem_load
-      , net_out, net_in, net_pkt_send_err, net_pkt_recv_err) =>
+      , net_out, net_in, net_pkt_send_err, net_pkt_recv_err, cdate, ftime) =>
         BasicRecord(now.toLong, id.toLong, cpu_usage.toDouble
-          , mem_phy_usage.toDouble, mem_cache_usage.toDouble, mem_load.toDouble
-          , net_out.toDouble, net_in.toDouble, net_pkt_send_err.toDouble, net_pkt_recv_err.toDouble)
+        ,mem_phy_usage.toDouble, mem_cache_usage.toDouble, mem_load.toDouble
+        ,net_out.toDouble, net_in.toDouble, net_pkt_send_err.toDouble, net_pkt_recv_err.toDouble
+        ,cdate.toLong, ftime.toByte
+        )
     }
     basicRecords
   }
@@ -364,8 +366,8 @@ root
 
   def readComplexRecords(sc:SparkContext, path:String) = {
     val complexRecords = sc.textFile(path).map{line => line.split(_SEPARATOR)}.map{
-      case Array(now, id, cate, item, usage) =>
-        ComplexRecord(now.toLong, id.toLong, cate.toByte, item:String, usage.toDouble)
+      case Array(now, id, cate, item, usage, cdate, ftime) =>
+        ComplexRecord(now.toLong, id.toLong, cate.toByte, item:String, usage.toDouble, cdate.toLong, ftime.toByte)
     }
     complexRecords
   }
@@ -392,31 +394,51 @@ root
   , [1441872159969,31208,3,/var,2.946591])
    */
 
-  def loadRecords2Hive(basicPaths:Array[(Long, String)], complexPaths:Array[(Long, String)]) = {
-    var url="jdbc:hive2://10.176.32.79:10000/tlbd?mapred.job.queue.name=root.PERSONAL.leoricklin"
+  def loadRecords2Table(tblPaths:Array[(String, String, String)]) = {
+    var url="jdbc:hive2://10.176.32.44:21050"
+    // var url="jdbc:hive2://10.176.32.44:21050"
     var username = "leoricklin"
     var password = "leoricklin"
     var driverName="org.apache.hive.jdbc.HiveDriver"
-    Class.forName(driverName).newInstance
-    val conn: Connection = DriverManager.getConnection(url, username, password)
-    val stmt: Statement = conn.createStatement()
-    var query = ""
-    //
-    val loadCnts: Array[Array[Boolean]] = for ( tbl <- Array((basicPaths, "basic_record"), (complexPaths, "complex_record")) ) yield {
-      val loadRows: Array[Boolean] = tbl._1.map{ case (partitionid, path) =>
-        query = f"load data inpath '${path}' into table ${tbl._2} partition (cdate=${partitionid})"
-        stmt.execute(query) // true if the first result is a ResultSet object; false if it is an update count or there are no results
-        /*
-        query = f"select count(1) from basic_record where cdate=${partitionid}"
-        val resultset: ResultSet = stmt.executeQuery(query)
-        if (resultset.next()) resultset.getLong(1) else 0L // 2586182
-         */
+    var conn: Connection = null
+    var selectCnts = Array(0L, 0L)
+    var sql = ""
+    try {
+      Class.forName(driverName).newInstance
+      conn = DriverManager.getConnection(url, username, password)
+      val stmt: Statement = conn.createStatement()
+      val initSQLs = Array(
+       "set REQUEST_POOL='root.PERSONAL.leoricklin'"
+      ,"use tlbd"
+      ,"""create table if not exists basic_record_stag (report_time BIGINT,agent_id BIGINT,cpu_usage DOUBLE,mem_phy_usage DOUBLE,mem_cache_usage DOUBLE,mem_load DOUBLE,net_out DOUBLE,net_in DOUBLE,net_pkt_send_err DOUBLE,net_pkt_recv_err DOUBLE,cdate BIGINT,ftime TINYINT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' STORED AS TEXTFILE"""
+      ,"""create table if not exists complex_record_stag ( report_time BIGINT,agent_id BIGINT,category TINYINT,item_name STRING,usage DOUBLE,cdate BIGINT,ftime TINYINT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' STORED AS TEXTFILE"""
+      ,"""create table if not exists basic_record ( report_time BIGINT,agent_id BIGINT,cpu_usage DOUBLE,mem_phy_usage DOUBLE,mem_cache_usage DOUBLE,mem_load DOUBLE,net_out DOUBLE,net_in DOUBLE,net_pkt_send_err DOUBLE,net_pkt_recv_err DOUBLE) PARTITIONED BY (cdate BIGINT, ftime TINYINT) STORED AS PARQUET"""
+      ,"""create table if not exists complex_record ( report_time BIGINT,agent_id BIGINT,category TINYINT,item_name STRING,usage DOUBLE) PARTITIONED BY (cdate BIGINT, ftime TINYINT) STORED AS PARQUET"""
+      )
+      initSQLs.foreach(sql => stmt.execute(sql) )
+      // load into staging
+      for (
+        tbls <- tblPaths
+      ) yield {
+        sql = f"load data inpath '${tbls._1}' into table ${tbls._2}"
+        stmt.execute(sql) // true if the first result is a ResultSet object; false if it is an update count or there are no results
       }
-      loadRows
+      // select count
+      selectCnts = for (
+        tbls <- tblPaths
+      ) yield {
+        sql = f"select count(1) from ${tbls._2}"
+        val rets = stmt.executeQuery(sql)
+        if (rets.next()) rets.getLong(1) else 0L
+      }
+      selectCnts
+    } catch {
+      case e:Exception => e.getMessage
+    } finally {
+      conn.close()
     }
     //
-    conn.close()
-    loadCnts
+    selectCnts
   }
   /*
     val basicRecords: JdbcRDD[BasicRecord] = new JdbcRDD( sc
@@ -467,29 +489,15 @@ $ hdfs dfs -ls /hive/tlbd_upload/iserver/log|wc -l
       }
       val tx = System.currentTimeMillis()
       val Array(inpath, basicoutpath, complexoutpath) = args
-      val raw: RDD[String] = loadSrc(sc, inpath)
-      val logDF: SchemaRDD = src2DF(sqlContext, raw)
-      val records: RDD[(Long, BasicRecord, ArrayBuffer[ComplexRecord])] = parseDF(sqlContext, logDF)
+      val logDF: SchemaRDD = loadSrc(sc, sqlContext, inpath)
+      val records: RDD[(BasicRecord, ArrayBuffer[ComplexRecord])] = parseDF(sqlContext, logDF)
       records.persist(StorageLevel.MEMORY_AND_DISK)
-      val partKeys: Array[Long] = records.map{case (key, basic, ary) => key}.distinct().collect()
-      val recordsByKey: Array[(Long, RDD[(Long, BasicRecord, ArrayBuffer[ComplexRecord])])] = partKeys.map{ idx =>
-        (idx, records.filter{ case (key, basic, ary) => key.equals(idx)} )
-      }
-      //
-      val basicCnts: Array[(Long, Long)] = recordsByKey.map{ case (idx, rdd) =>
-        ( idx
-          ,saveBasicRecords(rdd.map{ case (key, basic, ary) => basic}, f"${basicoutpath}.${idx.toString}")
-        )
-      }
-      val complexCnts: Array[(Long, Long)] = recordsByKey.map { case (idx, rdd) =>
-        ( idx
-          ,saveComplexRecords(rdd.flatMap{ case (key, basic, ary) => ary}, f"${complexoutpath}.${idx.toString}")
-        )
-      }
-      val basicPaths: Array[(Long, String)] = recordsByKey.map { case (idx, rdd) => (idx, f"${basicoutpath}.${idx.toString}") }
-      val complexPaths: Array[(Long, String)] = recordsByKey.map { case (idx, rdd) => (idx, f"${complexoutpath}.${idx.toString}") }
-      val cnts = loadRecords2Hive(basicPaths, complexPaths)
-      // Array(2586182, 26964238)
+      val basicCnts: Long = saveBasicRecords(records.map{ case (basic, ary) => basic}, f"${basicoutpath}.${tx}")
+      val complexCnts: Long = saveComplexRecords(records.flatMap{ case (basic, ary) => ary}, f"${complexoutpath}.${tx}")
+      val tblPaths = Array(
+        (f"${basicoutpath}.${tx}"  , "basic_record_stag"  , "basic_record")
+       ,(f"${complexoutpath}.${tx}", "complex_record_stag", "complex_record"))
+      val loadCnts: Array[Long] = loadRecords2Table(tblPaths)
     } catch {
       case e: org.apache.hadoop.mapred.InvalidInputException => System.err.println(e.getMessage)
     }
@@ -521,6 +529,11 @@ partKeys    : Array[Long] = Array(20150910, 20150911, 20150912, 20150913, 201509
 basicCnts   : Array[Long] = Array(615328  , 635940  , 660306  , 674579  , 665556  , 657641  , 652725  , 18)
 complexCnts : Array[Long] = Array(7145941 , 6280175 , 6529955 , 7007741 , 6655225 , 6441167 , 6327969 , 138)
 duration  : 2015/09/18 14:17:53 ~ 2015/09/18 14:20:44 = 2 min 51 sec
+
+basicCnts: Long = 4562093
+complexCnts: Long = 46388311
+loadCnts: Array[Long] = Array(4562093, 46388311)
+
    */
 
 }
