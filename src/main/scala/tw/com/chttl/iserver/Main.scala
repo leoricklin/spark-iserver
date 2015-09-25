@@ -1,13 +1,13 @@
 package tw.com.chttl.iserver
 
-import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd._
 import org.apache.spark.{SparkContext, SparkConf}
+import org.apache.spark.SparkContext._
 import org.apache.spark.sql.{SchemaRDD, Row}
 import org.apache.spark.storage.StorageLevel
 import scala.collection.mutable.ArrayBuffer
 import tw.com.chttl.spark.core.util._
 import tw.com.chttl.spark.mllib.util._
-import org.apache.spark.rdd.JdbcRDD
 import java.sql.{Statement, Connection, DriverManager, ResultSet}
 import java.util.Calendar
 
@@ -16,14 +16,6 @@ import java.util.Calendar
  */
 object Main {
   val appName = "iServer Log ETL"
-  val sparkConf = new SparkConf().setAppName(appName)
-  val sc = new SparkContext(sparkConf)
-  sc.getConf.set("spark.driver.maxResultSize", "2g")
-  sc.getConf.getOption("spark.driver.maxResultSize").getOrElse("")
-  //
-  import org.apache.spark.SparkContext._
-  val sqlContext = new org.apache.spark.sql.SQLContext(sc)
-  import sqlContext._
   val _SEPARATOR: String = "\t"
   val _CAT_HD: Byte = 1
   val _CAT_LV: Byte = 2
@@ -96,27 +88,30 @@ object Main {
     records
   }
 
-  def saveBasicRecords(parsedLogs: RDD[BasicRecord], path:String) = {
-    val saved = parsedLogs.map{ case BasicRecord(now:Long, id:Long, cpu_usage:Double
+  def saveRecords(records: RDD[(BasicRecord, ArrayBuffer[ComplexRecord])], basicpath:String, complexpath:String ) = {
+    val saveCnts = new Array[Long](2)
+    // coalesce(64) may cause case class not found exception
+    records.map{ case (basic, ary) => basic
+    }.map{ case BasicRecord(now:Long, id:Long, cpu_usage:Double
     , mem_phy_usage:Double, mem_cache_usage:Double, mem_load:Double
-    , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double, cdate:Long, ftime:Byte) =>
+    , net_out:Double, net_in:Double, net_pkt_send_err:Double, net_pkt_recv_err:Double
+    , cdate:Long, ftime:Byte) =>
       Array(now.toString, id.toString, cpu_usage.toString
       , mem_phy_usage.toString, mem_cache_usage.toString, mem_load.toString
       , net_out.toString, net_in.toString, net_pkt_send_err.toString, net_pkt_recv_err.toString
       , cdate.toString, ftime.toString
       ).mkString(_SEPARATOR)
-    }
-    saved.saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
-    saved.count()
-  }
-
-  def saveComplexRecords(parsedLogs: RDD[ComplexRecord], path:String) = {
-    val saved = parsedLogs.map{ case ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double, cdate:Long, ftime:Byte) =>
+    }.saveAsTextFile(basicpath, classOf[org.apache.hadoop.io.compress.SnappyCodec])
+    // coalesce(64) may cause case class not found exception
+    records.flatMap{ case (basic, ary) => ary
+    }.map{ case ComplexRecord(now:Long, id:Long, cate:Byte, item:String, usage:Double, cdate:Long, ftime:Byte) =>
       Array(now.toString, id.toString, cate.toString, item, usage.toString, cdate.toString, ftime.toString
       ).mkString(_SEPARATOR)
-    }
-    saved.saveAsTextFile(path, classOf[org.apache.hadoop.io.compress.SnappyCodec])
-    saved.count()
+    }.saveAsTextFile(complexpath, classOf[org.apache.hadoop.io.compress.SnappyCodec])
+    //
+    saveCnts(0) = records.map{ case (basic, ary) => basic}.count()
+    saveCnts(1) = records.flatMap{ case (basic, ary) => ary}.count()
+    saveCnts
   }
 
   def readBasicRecords(sc:SparkContext, path:String) = {
@@ -141,34 +136,48 @@ object Main {
     complexRecords
   }
 
-  def loadRecords2Table(tblPaths:Array[(String, String, String)]) = {
-    var url="jdbc:hive2://10.176.32.44:21050"
-    // var url="jdbc:hive2://10.176.32.44:21050"
-    var username = "leoricklin"
-    var password = "leoricklin"
+  def loadRecords2Table(tblInfo:Array[(String, String, String)], dbInfo:Array[String]) = {
+    /*
+        var url="jdbc:hive2://10.176.32.44:21050"
+        var username = "leoricklin"
+        var password = "leoricklin"
+        var yarnqueue = "root.PERSONAL.leoricklin"
+    */
+    val Array( jdbcurl, jdbcdb, jdbcuser, jdbcpwd, yarnqueue ) = dbInfo
     var driverName="org.apache.hive.jdbc.HiveDriver"
     var conn: Connection = null
-    var selectCnts = Array(0L, 0L)
-    var sql = ""
+    var loadCnts = Array(0L, 0L)
     try {
       Class.forName(driverName).newInstance
-      conn = DriverManager.getConnection(url, username, password)
+      conn = DriverManager.getConnection(jdbcurl, jdbcuser, jdbcpwd)
       val stmt: Statement = conn.createStatement()
-      val initSQLs = Array(
-       "set REQUEST_POOL='root.PERSONAL.leoricklin'"
-      ,"use tlbd"
-      ,"""create table if not exists basic_record_stag (report_time BIGINT,agent_id BIGINT,cpu_usage DOUBLE,mem_phy_usage DOUBLE,mem_cache_usage DOUBLE,mem_load DOUBLE,net_out DOUBLE,net_in DOUBLE,net_pkt_send_err DOUBLE,net_pkt_recv_err DOUBLE,cdate BIGINT,ftime TINYINT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' STORED AS TEXTFILE"""
-      ,"""create table if not exists complex_record_stag ( report_time BIGINT,agent_id BIGINT,category TINYINT,item_name STRING,usage DOUBLE,cdate BIGINT,ftime TINYINT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' STORED AS TEXTFILE"""
-      )
-      initSQLs.foreach(sql => stmt.execute(sql) )
-      // load into staging table
+      var sqls = Array("")
+      // init DB env
+      sqls = Array(f"set REQUEST_POOL='${yarnqueue}'"
+        ,f"use ${jdbcdb}")
+      sqls.foreach(sql => stmt.execute(sql) ) // true if the first result is a ResultSet object; false if it is an update count or there are no results
+      // load into staging table from saved files
+      sqls = tblInfo.map{ case (path, stag, tbl) =>
+        f"load data inpath '${path}' OVERWRITE into table ${stag}"
+      }
+      sqls.foreach{sql => stmt.execute(sql) }
+/*
       for (
-        tbls <- tblPaths
+        tbls <- tblInfo
       ) yield {
         sql = f"load data inpath '${tbls._1}' into table ${tbls._2}"
         stmt.execute(sql) // true if the first result is a ResultSet object; false if it is an update count or there are no results
       }
+*/
       // select count from staging table
+      sqls = tblInfo.map { case (path, stag, tbl) =>
+        f"select count(1) from ${stag}"
+      }
+      loadCnts = sqls.map{sql =>
+        val ret: ResultSet = stmt.executeQuery(sql)
+        if (ret.next()) ret.getLong(1) else 0L
+      }
+/*
       selectCnts = for (
         tbls <- tblPaths
       ) yield {
@@ -176,36 +185,40 @@ object Main {
         val rets = stmt.executeQuery(sql)
         if (rets.next()) rets.getLong(1) else 0L
       }
-      // insert into partitioned table
-      sql = "set COMPRESSION_CODEC=snappy"
-      stmt.execute(sql)
-      sql = "insert into basic_record ( report_time,agent_id,cpu_usage,mem_phy_usage,mem_cache_usage,mem_load,net_out,net_in,net_pkt_send_err,net_pkt_recv_err) partition (cdate, ftime) select report_time,agent_id,cpu_usage,mem_phy_usage,mem_cache_usage,mem_load,net_out,net_in,net_pkt_send_err,net_pkt_recv_err,cdate,ftime from basic_record_stag"
-      stmt.executeUpdate(sql) // result is 0
-      sql = "insert into complex_record (report_time,agent_id,category,item_name,usage) partition (cdate, ftime) select report_time,agent_id,category,item_name,usage,cdate,ftime from complex_record_stag"
-      stmt.executeUpdate(sql) // result is 0
-      sql = "set COMPRESSION_CODEC=NONE"
-      stmt.execute(sql)
+*/
+      // insert into partitioned table from staging tables
+      sqls = Array("set COMPRESSION_CODEC=snappy"
+        ,"insert into basic_record ( report_time,agent_id,cpu_usage,mem_phy_usage,mem_cache_usage,mem_load,net_out,net_in,net_pkt_send_err,net_pkt_recv_err) partition (cdate, ftime) select report_time,agent_id,cpu_usage,mem_phy_usage,mem_cache_usage,mem_load,net_out,net_in,net_pkt_send_err,net_pkt_recv_err,cdate,ftime from basic_record_stag"
+        ,"insert into complex_record (report_time,agent_id,category,item_name,usage) partition (cdate, ftime) select report_time,agent_id,category,item_name,usage,cdate,ftime from complex_record_stag"
+        ,"set COMPRESSION_CODEC=NONE")
+      /*
+            sql = "set COMPRESSION_CODEC=snappy"
+            stmt.execute(sql)
+            sql = "insert into basic_record ( report_time,agent_id,cpu_usage,mem_phy_usage,mem_cache_usage,mem_load,net_out,net_in,net_pkt_send_err,net_pkt_recv_err) partition (cdate, ftime) select report_time,agent_id,cpu_usage,mem_phy_usage,mem_cache_usage,mem_load,net_out,net_in,net_pkt_send_err,net_pkt_recv_err,cdate,ftime from basic_record_stag"
+            stmt.executeUpdate(sql) // result is 0
+            sql = "insert into complex_record (report_time,agent_id,category,item_name,usage) partition (cdate, ftime) select report_time,agent_id,category,item_name,usage,cdate,ftime from complex_record_stag"
+            stmt.executeUpdate(sql) // result is 0
+            sql = "set COMPRESSION_CODEC=NONE"
+            stmt.execute(sql)
+      */
+      sqls.foreach{sql => stmt.execute(sql) }
       // drop staging table
-      sql = "drop table if exists basic_record_stag"
-      stmt.execute(sql)
-      sql = "drop table if exists complex_record_stag"
-      stmt.execute(sql)
-      selectCnts
+      /*
+            sql = "drop table if exists basic_record_stag"
+            stmt.execute(sql)
+            sql = "drop table if exists complex_record_stag"
+            stmt.execute(sql)
+      */
+      loadCnts
     } catch {
       case e:Exception => System.err.println(e.printStackTrace())
     } finally {
       conn.close()
     }
-    selectCnts
+    loadCnts
   }
 
   /*
-val args = Array("/home/leoricklin/dataset/iserver")
-
-val args = Array("hdfs:///hive/tlbd_upload/iserver/log"
-,"hdfs:///hive/tlbd_upload/iserver/txt/basic"
-,"hdfs:///hive/tlbd_upload/iserver/txt/complex")
-
 val args = Array("hdfs:///hive/tlbd_upload/iserver/log/test"
 ,"hdfs:///hive/tlbd_upload/iserver/txt/basic"
 ,"hdfs:///hive/tlbd_upload/iserver/txt/complex")
@@ -263,43 +276,89 @@ hdfs dfs -ls /hive/tlbd_upload/iserver/log/test/2015*.gz|wc -l
 hdfs dfs -du -s /hive/tlbd_upload/iserver/log/test
 8,930,302,951  26790908853  /hive/tlbd_upload/iserver/log/test
 
+Array(103,492,918, 1,044,461,739)
+19 	count at <console>:44 	        2015/09/23 10:47:56 	33 s 	    1/1 	159/159
+18 	saveAsTextFile at <console>:43 	2015/09/23 10:47:03 	51 s 	    1/1 	159/159
+17 	count at <console>:49 	        2015/09/23 10:45:22 	1.7 min 	1/1 	159/159
+16 	saveAsTextFile at <console>:48 	2015/09/23 10:41:45 	3.6 min 	1/1 	159/159
+15 	reduce at JsonRDD.scala:57 	    2015/09/23 10:37:48 	3.9 min 	1/1 	159/159
+
+### round 1.5 test, 1 core / 8GB * 64 executors, application_1441962795736_29047 (no restart spark app)
+hdfs dfs -mv /hive/tlbd_upload/iserver/log/20150918-*.gz /hive/tlbd_upload/iserver/log/test/
+hdfs dfs -mv /hive/tlbd_upload/iserver/log/20150919-*.gz /hive/tlbd_upload/iserver/log/test/
+hdfs dfs -ls /hive/tlbd_upload/iserver/log/test/2015*.gz|wc -l
+199
+hdfs dfs -du -s /hive/tlbd_upload/iserver/log/test
+11,097,604,291  33292812873  /hive/tlbd_upload/iserver/log/test
+
+24 	count at <console>:44 	        2015/09/23 11:07:13 	36 s 	0/1 (1 failed) 	189/199 (6 failed)
+23 	saveAsTextFile at <console>:43 	2015/09/23 11:04:32 	2.6 min 	1/1 	199/199 (5 failed)
+22 	count at <console>:49 	        2015/09/23 11:03:05 	1.4 min 	1/1 	199/199
+21 	saveAsTextFile at <console>:48 	2015/09/23 10:59:13 	3.8 min 	1/1 	199/199 (1 failed)
+20 	reduce at JsonRDD.scala:57 	    2015/09/23 10:54:10 	5.0 min 	1/1 	199/199
+
+### round 1.6 test, 1 core / 8GB * 64 executors, application_1441962795736_29047 (no restart spark app)
+hdfs dfs -ls /hive/tlbd_upload/iserver/log/test/2015*.gz|wc -l
+199
+hdfs dfs -du -s /hive/tlbd_upload/iserver/log/test
+11,097,604,291  33292812873  /hive/tlbd_upload/iserver/log/test
+
+Array(128898598, 1289759999)
+33 	count at <console>:91 	        2015/09/23 12:30:27 	2.0 min 	1/1   199/199
+32  count at <console>:90 	        2015/09/23 12:27:42 	2.8 min 	1/1   199/199 (13 failed)
+31  saveAsTextFile at <console>:88 	2015/09/23 12:24:36 	3.1 min 	1/1   199/199 (7 failed)
+30  saveAsTextFile at <console>:82 	2015/09/23 12:18:34 	6.0 min 	1/1   199/199 (2 failed)
+29  reduce at JsonRDD.scala:57 	    2015/09/23 12:12:40 	5.9 min 	1/1   199/199
    */
+/*
+val args = Array("hdfs:///hive/tlbd_upload/iserver/log/small"
+,"hdfs:///hive/tlbd_upload/iserver/txt/basic"   , "basic_record_stag"    , "basic_record"
+,"hdfs:///hive/tlbd_upload/iserver/txt/complex" , "complex_record_stag"  , "complex_record"
+,"root.PERSONAL.leoricklin", "jdbc:hive2://10.176.32.44:21050", "tlbd", "leoricklin", "leoricklin"
+)
+ */
+
   def main(args: Array[String]) {
+    val sparkConf = new SparkConf().setAppName(appName)
+    val sc = new SparkContext(sparkConf)
+    //
+    val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+    import sqlContext._
+
     try {
-      if (args.length != 3) {
-        println("Usage: <app_name> <input_path> <basic_output_path> <complex_output_path>")
+      if (args.length != 12) {
+        println(
+          "Usage: <app_name> <input_path>                                 \\ \n" +
+          " <basic_output_path>   <basic_stag_tblname>   <basic_tblname>  \\ \n" +
+          " <complex_output_path> <complex_stag_tblname> <complex_tblname>\\ \n" +
+          " <yarn_queue> <jdbc_url> <jdbc_db> <jdbc_user> <jdbc_pwd>"
+        )
         System.exit(1)
       }
       val tx = System.currentTimeMillis()
-      val Array(inpath, basicoutpath, complexoutpath) = args
+      val Array(inpath
+        , basicoutpath,   basic_stag_tbl,   basic_tbl
+        , complexoutpath, complex_stag_tbl, complex_tbl
+        , yarnqueue, jdbcurl, jdbcdb, jdbcuser, jdbcpwd) = args
       val logDF: SchemaRDD = loadSrc(sc, sqlContext, inpath)
       val records: RDD[(BasicRecord, ArrayBuffer[ComplexRecord])] = parseDF(sqlContext, logDF)
       records.persist(StorageLevel.MEMORY_AND_DISK)
-      val parseCnts = new Array[Long](2)
-      parseCnts(0) = saveBasicRecords(records.map{ case (basic, ary) => basic}, f"${basicoutpath}.${tx}")
-      parseCnts(1) = saveComplexRecords(records.flatMap{ case (basic, ary) => ary}, f"${complexoutpath}.${tx}")
-      val tblPaths = Array(
-        (f"${basicoutpath}.${tx}"  , "basic_record_stag"  , "basic_record")
-       ,(f"${complexoutpath}.${tx}", "complex_record_stag", "complex_record"))
-      val loadCnts: Array[Long] = loadRecords2Table(tblPaths)
+      val saveCnts: Array[Long] = saveRecords(records, f"${basicoutpath}.${tx}", f"${complexoutpath}.${tx}")
+      val tblInfo = Array(
+        (f"${basicoutpath}.${tx}"  , basic_stag_tbl  , basic_tbl)
+       ,(f"${complexoutpath}.${tx}", complex_stag_tbl, complex_tbl))
+      val dbInfo: Array[String] = Array( jdbcurl, jdbcdb, jdbcuser, jdbcpwd, yarnqueue )
+      val loadCnts: Array[Long] = loadRecords2Table(tblInfo, dbInfo)
+      System.out.println()
     } catch {
       case e: org.apache.hadoop.mapred.InvalidInputException => System.err.println(e.getMessage)
     }
   }
 /*
-resources : 1 core / 4g * 64 workers
-input     : 484 files with total size of 4,039,541,352
-output    :
-partKeys    : Array[Long] = Array(20150910, 20150911, 20150912, 20150913, 20150914, 20150915, 20150916, 20150917)
-basicCnts   : Array[Long] = Array(615328  , 635940  , 660306  , 674579  , 665556  , 657641  , 652725  , 18)
-complexCnts : Array[Long] = Array(7145941 , 6280175 , 6529955 , 7007741 , 6655225 , 6441167 , 6327969 , 138)
-duration  : 2015/09/18 14:17:53 ~ 2015/09/18 14:20:44 = 2 min 51 sec
-
-basicCnts: Long = 4562093
-complexCnts: Long = 46388311
-loadCnts: Array[Long] = Array(4562093, 46388311)
- */
-/*
-
+load2table
+### round 1.6 test, 1 core / 8GB * 64 executors, application_1441962795736_29047 (no restart spark app)
+Array(128898598, 1289759999)
+14:26 ~ 14:30
+loadCnts: Array[Long] = Array(128898598, 1289759999)
  */
 }
