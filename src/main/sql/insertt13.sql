@@ -76,8 +76,8 @@ insert into basic_record_sum_hr (
 , ftime
 , cdate
  from basic_record
- where cdate = 20150913
- and ftime = 0
+ where cdate = cast(concat(cast(extract(now(), "year") as string),cast(extract(now(), "month") as string),cast(extract(now(), "day") as string)) as bigint)
+ and ftime = cast(extract(now(), "hour") as tinyint)
  group by agent_id, cdate, ftime;
 set COMPRESSION_CODEC=NONE;
 /*
